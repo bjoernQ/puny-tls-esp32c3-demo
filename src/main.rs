@@ -1,13 +1,16 @@
 #![no_std]
 #![no_main]
 
+use embedded_hal::watchdog::WatchdogDisable;
 use embedded_io::blocking::{Read, Write};
 use embedded_io::Io;
 use embedded_svc::wifi::{
     ClientConfiguration, ClientConnectionStatus, ClientIpStatus, ClientStatus, Configuration,
     Status, Wifi,
 };
-use esp32c3_hal::RtcCntl;
+use esp32c3_hal::clock::{ClockControl, CpuClock};
+use esp32c3_hal::prelude::*;
+use esp32c3_hal::Rtc;
 use esp_println::println;
 use esp_wifi::wifi::initialize;
 use esp_wifi::wifi::utils::create_network_interface;
@@ -16,14 +19,13 @@ use esp_wifi::{create_network_stack_storage, network_stack_storage};
 
 use esp32c3_hal::pac::Peripherals;
 use esp_backtrace as _;
+use puny_tls::Session;
 use rand_core::RngCore;
 use riscv_rt::entry;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::TcpSocket;
 use smoltcp::time::Instant;
 use smoltcp::wire::Ipv4Address;
-use tiny_tls::buffer::Buffer;
-use tiny_tls::Session;
 
 extern crate alloc;
 
@@ -32,26 +34,24 @@ const PASSWORD: &str = env!("PASSWORD");
 
 #[entry]
 fn main() -> ! {
-    let mut peripherals = Peripherals::take().unwrap();
+    // init_logger();
+    esp_wifi::init_heap();
 
-    let mut rtc_cntl = RtcCntl::new(peripherals.RTC_CNTL);
+    let mut peripherals = Peripherals::take().unwrap();
+    let system = peripherals.SYSTEM.split();
+    let clocks = ClockControl::configure(system.clock_control, CpuClock::Clock160MHz).freeze();
+
+    let mut rtc_cntl = Rtc::new(peripherals.RTC_CNTL);
 
     // Disable watchdog timers
-    rtc_cntl.set_super_wdt_enable(false);
-    rtc_cntl.set_wdt_enable(false);
+    rtc_cntl.swd.disable();
+    rtc_cntl.rwdt.disable();
 
     let mut storage = create_network_stack_storage!(3, 8, 1);
     let ethernet = create_network_interface(network_stack_storage!(storage));
     let mut wifi_interface = esp_wifi::wifi_interface::Wifi::new(ethernet);
 
-    init_logger();
-
-    initialize(
-        &mut peripherals.SYSTIMER,
-        &mut peripherals.INTERRUPT_CORE0,
-        peripherals.RNG,
-    )
-    .unwrap();
+    initialize(&mut peripherals.SYSTIMER, peripherals.RNG, &clocks).unwrap();
 
     println!("{:?}", wifi_interface.get_status());
 
@@ -105,24 +105,30 @@ fn main() -> ! {
         .network_interface()
         .get_socket_and_context::<TcpSocket>(http_socket_handle);
 
-    let remote_endpoint = (Ipv4Address::new(142, 250, 185, 100), 443); // www.google.com
+    let remote_endpoint = (Ipv4Address::new(23, 15, 178, 162), 443); // tls13.akamai.io
     socket.connect(cx, remote_endpoint, 41000).unwrap();
 
     let io = InputOutput::new(wifi_interface, http_socket_handle, current_millis);
     let mut rng = Rng::new();
 
-    let mut tls = Session::new(io, "www.google.com", &mut rng);
-    tls.connect().expect("Tls connect failed");
+    let mut tls: puny_tls::Session<'_, InputOutput, 8096> =
+        Session::new(io, "tls13.akamai.io", &mut rng);
 
-    tls.send_data(Buffer::new_from_slice(
-        b"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n",
-    ))
-    .expect("Send application data failed");
-    tls.receive_data().expect("Receiving session ticket failed"); // ignore session ticket
-    let data = tls.receive_data().unwrap();
-    println!("{}", unsafe {
-        core::str::from_utf8_unchecked(data.slice())
-    });
+    tls.write("GET / HTTP/1.0\r\nHost: tls13.akamai.io\r\n\r\n".as_bytes())
+        .unwrap();
+
+    loop {
+        let mut buf = [0u8; 512];
+        match tls.read(&mut buf) {
+            Ok(len) => {
+                println!("{}", unsafe { core::str::from_utf8_unchecked(&buf[..len]) });
+            }
+            Err(err) => {
+                println!("Got error: {:?}", err);
+                break;
+            }
+        }
+    }
 
     println!("That's it for now");
 
